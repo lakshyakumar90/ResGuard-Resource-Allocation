@@ -87,5 +87,8 @@
   "2025-03-18 00:07:56 - System Network changed from 39.00 to 4.00",
   "2025-03-18 00:08:01 - System CPU changed from 2.86 to 3.36",
   "2025-03-18 00:08:01 - System Network changed from 50.00 to 56.00",
-  "2025-03-18 00:08:02 - WARNING: System entered unsafe state due to resource changes!"
+  "2025-03-18 00:08:02 - WARNING: System entered unsafe state due to resource changes!",
+  "2025-03-18 00:08:07 - System CPU changed from 0.30 to 0.10",
+  "2025-03-18 00:08:07 - System Network changed from 13.00 to 80.00",
+  "2025-03-18 00:08:07 - WARNING: System entered unsafe state due to resource changes!"
 ]
