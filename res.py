@@ -1,23 +1,15 @@
 import threading
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
 import time
 import json
 import os
 import pandas as pd
 import dash
-from dash import dcc, html
+from dash import dcc, html, Input, Output, State, callback
 import plotly.graph_objs as go
-from dash.dependencies import Input, Output
-from flask import Flask
+from flask import Flask, redirect, url_for, request, session, flash
 import webbrowser
 import numpy as np
 import psutil  # Added psutil for real system monitoring
-
-if not os.environ.get("DISPLAY"):
-    print("No display found, running in CLI mode.")
-    # Run CLI-based logic here instead of GUI
-    exit()
 
 # Global Variables
 mutex = threading.Lock()
@@ -102,19 +94,11 @@ def save_state():
             json.dump(max_claim, f, indent=2)
     except Exception as e:
         print(f"Error saving state: {e}")
-        messagebox.showerror("Save Error", f"Failed to save state: {e}")
 
 def log_event(event):
     timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
     log_entry = f"{timestamp} - {event}"
     logs.append(log_entry)
-    
-    # Update the log display if it exists
-    if 'log_display' in globals() and log_display.winfo_exists():
-        log_display.configure(state='normal')
-        log_display.insert(tk.END, log_entry + "\n")
-        log_display.see(tk.END)
-        log_display.configure(state='disabled')
     
     # Save after each log to prevent data loss
     with open(LOG_FILE, "w") as f:
@@ -198,8 +182,8 @@ def request_resource(user, resource):
         
         # Check if the resource is available
         if resources[resource] <= 0:
-            messagebox.showwarning("Resource Unavailable", f"No {resource} units available!")
-            return False
+            log_event(f"{user} request denied: No {resource} units available!")
+            return False, f"No {resource} units available!"
         
         # Calculate how much to allocate (scaled for different resource types)
         allocation_amount = 0.1  # Default small amount
@@ -214,15 +198,15 @@ def request_resource(user, resource):
         
         # Check if resource has enough to allocate
         if resources[resource] < allocation_amount:
-            messagebox.showwarning("Resource Unavailable", 
-                f"Not enough {resource} available! (Needed: {allocation_amount}, Available: {resources[resource]:.2f})")
-            return False
+            message = f"Not enough {resource} available! (Needed: {allocation_amount}, Available: {resources[resource]:.2f})"
+            log_event(f"{user} request denied: {message}")
+            return False, message
         
         # Check if this request would exceed max claim
         if allocation[user][resource] + allocation_amount > max_claim[user][resource]:
-            messagebox.showwarning("Claim Exceeded", 
-                f"Request denied: Would exceed your maximum claim of {max_claim[user][resource]:.2f} for {resource}!")
-            return False
+            message = f"Request denied: Would exceed your maximum claim of {max_claim[user][resource]:.2f} for {resource}!"
+            log_event(f"{user} request denied: {message}")
+            return False, message
         
         # Temporarily allocate the resource to check safety
         allocation[user][resource] += allocation_amount
@@ -236,18 +220,19 @@ def request_resource(user, resource):
             
             # Check for alerts after allocation
             alerts = check_resource_usage()
+            alert_message = ""
             if alerts:
-                messagebox.showwarning("Resource Alert", "\n".join(alerts))
+                alert_message = "Alerts: " + ", ".join(alerts)
+                log_event(f"Resource alerts: {alert_message}")
             
             save_state()
-            return True
+            return True, f"Successfully allocated {allocation_amount} unit of {resource}" + (f". {alert_message}" if alert_message else "")
         else:
             # Revert the allocation as it would lead to an unsafe state
             allocation[user][resource] -= allocation_amount
+            message = "Request denied: Granting this resource would lead to a potential deadlock!"
             log_event(f"{user} denied {allocation_amount} unit of {resource} - Would lead to unsafe state")
-            messagebox.showwarning("Unsafe Allocation", 
-                "Request denied: Granting this resource would lead to a potential deadlock!")
-            return False
+            return False, message
 
 def release_resource(user, resource):
     with mutex:
@@ -270,38 +255,40 @@ def release_resource(user, resource):
             if is_safe:
                 log_event(f"System is in safe state after release. Safe sequence: {' -> '.join(safe_sequence)}")
             save_state()
-            return True
+            return True, f"Successfully released {release_amount} unit of {resource}"
         else:
-            messagebox.showwarning("Invalid Release", 
-                f"{user} has not allocated enough {resource}! (Has: {allocation[user][resource]:.2f}, Trying to release: {release_amount})")
-            return False
+            message = f"{user} has not allocated enough {resource}! (Has: {allocation[user][resource]:.2f}, Trying to release: {release_amount})"
+            log_event(message)
+            return False, message
 
 def update_max_claim(user, resource, new_max):
     with mutex:
-        # Validate the new maximum claim
-        if new_max < allocation[user][resource]:
-            messagebox.showwarning("Invalid Max Claim", 
-                f"Maximum claim cannot be less than current allocation ({allocation[user][resource]:.2f})!")
-            return False
-        
-        # Update the max claim
-        max_claim[user][resource] = new_max
-        log_event(f"{user}'s maximum claim for {resource} updated to {new_max}")
-        
-        # Check if the system is still in a safe state
-        is_safe, safe_sequence = is_safe_state()
-        if is_safe:
-            log_event(f"System remains in safe state after max claim update. Safe sequence: {' -> '.join(safe_sequence)}")
-            save_state()
-            return True
-        else:
-            # This shouldn't happen from just updating max claim if current allocation is valid
-            # but we'll check anyway
-            log_event(f"Warning: System is now in unsafe state after max claim update!")
-            messagebox.showwarning("Safety Warning", 
-                "The system is now in an unsafe state! Consider releasing some resources.")
-            save_state()
-            return True  # Still allow the update, but warn the user
+        try:
+            new_max = float(new_max)
+            # Validate the new maximum claim
+            if new_max < allocation[user][resource]:
+                message = f"Maximum claim cannot be less than current allocation ({allocation[user][resource]:.2f})!"
+                log_event(f"{user} max claim update failed: {message}")
+                return False, message
+            
+            # Update the max claim
+            max_claim[user][resource] = new_max
+            log_event(f"{user}'s maximum claim for {resource} updated to {new_max}")
+            
+            # Check if the system is still in a safe state
+            is_safe, safe_sequence = is_safe_state()
+            if is_safe:
+                log_event(f"System remains in safe state after max claim update. Safe sequence: {' -> '.join(safe_sequence)}")
+                save_state()
+                return True, f"Maximum claim for {resource} updated to {new_max}"
+            else:
+                # This shouldn't happen from just updating max claim if current allocation is valid
+                # but we'll check anyway
+                log_event(f"Warning: System is now in unsafe state after max claim update!")
+                save_state()
+                return True, f"Maximum claim updated, but system is now in an unsafe state! Consider releasing some resources."
+        except ValueError:
+            return False, "Invalid value. Please enter a number."
 
 def system_monitor():
     """Thread function to continuously monitor system resources"""
@@ -324,58 +311,318 @@ def system_monitor():
         except Exception as e:
             print(f"Error in system_monitor thread: {e}")
 
-# -------------------- DASH REAL-TIME DASHBOARD --------------------
+# -------------------- FLASK/DASH WEB APPLICATION --------------------
 
+# Initialize Flask server and Dash app
 server = Flask(__name__)
-app = dash.Dash(__name__, server=server)
+server.secret_key = 'resource_manager_secret_key'  # For session management
+app = dash.Dash(__name__, server=server, url_base_pathname='/dashboard/')
 
-# Dashboard Layout
-app.layout = html.Div(children=[
-    html.H1("ResGuard Resource Monitoring Dashboard", style={'textAlign': 'center'}),
-    
+# Define the layout for the Dash app
+app.layout = html.Div([
+    dcc.Location(id='url', refresh=False),
+    html.Div(id='page-content')
+])
+
+# Define the dashboard layout
+dashboard_layout = html.Div([
     html.Div([
+        html.H1("ResGuard Resource Management System", style={'textAlign': 'center'}),
         html.Div([
-            html.H3("Available Resources", style={'textAlign': 'center'}),
-            dcc.Graph(id="resources-graph"),
-        ], className='six columns'),
+            html.Span("Logged in as: ", style={'fontWeight': 'bold'}),
+            html.Span(id='user-display'),
+            html.Button('Logout', id='logout-button', style={'marginLeft': '20px'})
+        ], style={'textAlign': 'right', 'padding': '10px'}),
         
-        html.Div([
-            html.H3("Resource Allocation by User", style={'textAlign': 'center'}),
-            dcc.Graph(id="allocation-graph"),
-        ], className='six columns'),
-    ], className='row'),
-    
-    html.Div([
-        html.H3("System Resource Usage", style={'textAlign': 'center'}),
-        dcc.Graph(id="system-usage-graph"),
-    ]),
-    
-    html.Div([
-        html.H3("Banker's Algorithm Safety Status", style={'textAlign': 'center'}),
-        html.Div(id="safety-status", style={
-            'border': '1px solid #ddd',
-            'padding': '10px',
-            'marginBottom': '20px',
-            'textAlign': 'center',
-            'fontSize': '18px'
-        })
-    ]),
-    
-    html.Div([
-        html.H3("System Logs", style={'textAlign': 'center'}),
-        html.Div(id="logs-container", style={
-            'height': '200px',
-            'overflowY': 'scroll',
-            'border': '1px solid #ddd',
-            'padding': '10px',
-            'marginBottom': '20px'
-        })
-    ]),
-    
-    dcc.Interval(id="interval-update", interval=2000, n_intervals=0)
-], style={'padding': '20px'})
+        dcc.Tabs([
+            dcc.Tab(label='Resource Management', children=[
+                html.Div([
+                    html.Div([
+                        html.H3("Request/Release Resources"),
+                        html.Div([
+                            html.Label("Select Resource:"),
+                            dcc.Dropdown(
+                                id='resource-dropdown',
+                                options=[{'label': res, 'value': res} for res in resources.keys()],
+                                value='CPU'
+                            ),
+                            html.Div([
+                                html.Button('Request Resource', id='request-button', 
+                                           style={'marginRight': '10px', 'backgroundColor': '#4CAF50', 'color': 'white'}),
+                                html.Button('Release Resource', id='release-button',
+                                           style={'backgroundColor': '#f44336', 'color': 'white'})
+                            ], style={'marginTop': '10px', 'marginBottom': '10px'}),
+                            html.Div(id='resource-message', style={'marginTop': '10px', 'padding': '10px', 'border': '1px solid #ddd'})
+                        ], style={'padding': '15px', 'border': '1px solid #ddd', 'borderRadius': '5px'})
+                    ], className='six columns'),
+                    
+                    html.Div([
+                        html.H3("Max Claim Management"),
+                        html.Div([
+                            html.Label("Select Resource:"),
+                            dcc.Dropdown(
+                                id='max-claim-resource',
+                                options=[{'label': res, 'value': res} for res in resources.keys()],
+                                value='CPU'
+                            ),
+                            html.Label("New Max Claim Value:", style={'marginTop': '10px'}),
+                            dcc.Input(id='max-claim-value', type='number', min=0, step=0.1),
+                            html.Button('Update Max Claim', id='update-max-claim', 
+                                       style={'marginTop': '10px', 'backgroundColor': '#2196F3', 'color': 'white'}),
+                            html.Div(id='max-claim-message', style={'marginTop': '10px', 'padding': '10px', 'border': '1px solid #ddd'})
+                        ], style={'padding': '15px', 'border': '1px solid #ddd', 'borderRadius': '5px'})
+                    ], className='six columns')
+                ], className='row', style={'marginBottom': '20px'}),
+                
+                html.Div([
+                    html.H3("Your Current Allocations"),
+                    html.Div(id='user-allocations', style={'padding': '15px', 'border': '1px solid #ddd', 'borderRadius': '5px'})
+                ], style={'marginBottom': '20px'})
+            ]),
+            
+            dcc.Tab(label='System Monitor', children=[
+                html.Div([
+                    html.Div([
+                        html.H3("Available Resources", style={'textAlign': 'center'}),
+                        dcc.Graph(id="resources-graph"),
+                    ], className='six columns'),
+                    
+                    html.Div([
+                        html.H3("Resource Allocation by User", style={'textAlign': 'center'}),
+                        dcc.Graph(id="allocation-graph"),
+                    ], className='six columns'),
+                ], className='row'),
+                
+                html.Div([
+                    html.H3("System Resource Usage", style={'textAlign': 'center'}),
+                    dcc.Graph(id="system-usage-graph"),
+                ]),
+                
+                html.Div([
+                    html.H3("Banker's Algorithm Safety Status", style={'textAlign': 'center'}),
+                    html.Div(id="safety-status", style={
+                        'border': '1px solid #ddd',
+                        'padding': '10px',
+                        'marginBottom': '20px',
+                        'textAlign': 'center',
+                        'fontSize': '18px'
+                    })
+                ]),
+            ]),
+            
+            dcc.Tab(label='System Logs', children=[
+                html.Div([
+                    html.H3("System Activity Logs", style={'textAlign': 'center'}),
+                    html.Button('Clear Logs', id='clear-logs-button', 
+                               style={'marginBottom': '10px', 'backgroundColor': '#f44336', 'color': 'white'}),
+                    html.Div(id="logs-container", style={
+                        'height': '400px',
+                        'overflowY': 'scroll',
+                        'border': '1px solid #ddd',
+                        'padding': '10px',
+                        'marginBottom': '20px',
+                        'fontFamily': 'monospace'
+                    })
+                ])
+            ]),
+        ]),
+        
+        dcc.Interval(id="interval-update", interval=2000, n_intervals=0)
+    ], style={'padding': '20px', 'maxWidth': '1200px', 'margin': '0 auto'})
+])
 
-# Define callback to update graphs
+# Login page layout
+login_layout = html.Div([
+    html.H1("ResGuard Resource Management System", style={'textAlign': 'center'}),
+    html.Div([
+        html.H2("Login", style={'textAlign': 'center'}),
+        html.Div([
+            html.Label("Username:"),
+            dcc.Input(id='username-input', type='text', placeholder='Enter username'),
+            html.Label("Password:", style={'marginTop': '10px'}),
+            dcc.Input(id='password-input', type='password', placeholder='Enter password'),
+            html.Button('Login', id='login-button', style={'marginTop': '20px', 'width': '100%'}),
+            html.Div(id='login-message', style={'marginTop': '10px', 'color': 'red'})
+        ], style={'width': '300px', 'margin': '0 auto', 'padding': '20px', 'border': '1px solid #ddd', 'borderRadius': '5px'})
+    ])
+])
+
+# Define Flask routes
+@server.route('/')
+def index():
+    if 'user' in session:
+        return redirect('/dashboard/')
+    return redirect('/login')
+
+@server.route('/login')
+def login():
+    return redirect('/dashboard/login')
+
+@server.route('/logout')
+def logout():
+    if 'user' in session:
+        log_event(f"User {session['user']} logged out")
+    session.pop('user', None)
+    return redirect('/login')
+
+# Define Dash callbacks
+@app.callback(
+    Output('page-content', 'children'),
+    [Input('url', 'pathname')]
+)
+def display_page(pathname):
+    if pathname == '/dashboard/login':
+        return login_layout
+    elif pathname == '/dashboard/' or pathname == '/dashboard':
+        if 'user' in session:
+            return dashboard_layout
+        else:
+            return login_layout
+    else:
+        return login_layout
+
+@app.callback(
+    [Output('login-message', 'children'),
+     Output('url', 'pathname')],
+    [Input('login-button', 'n_clicks')],
+    [State('username-input', 'value'),
+     State('password-input', 'value')]
+)
+def process_login(n_clicks, username, password):
+    if n_clicks is None or n_clicks == 0:
+        return "", dash.no_update
+    
+    if not username or not password:
+        return "Please enter both username and password", dash.no_update
+    
+    if username in users and users[username] == password:
+        session['user'] = username
+        log_event(f"User {username} logged in")
+        return "", "/dashboard/"
+    else:
+        return "Invalid username or password", dash.no_update
+
+@app.callback(
+    Output('url', 'pathname', allow_duplicate=True),
+    [Input('logout-button', 'n_clicks')],
+    prevent_initial_call=True
+)
+def process_logout(n_clicks):
+    if n_clicks:
+        if 'user' in session:
+            log_event(f"User {session['user']} logged out")
+        session.pop('user', None)
+        return "/dashboard/login"
+    return dash.no_update
+
+@app.callback(
+    Output('user-display', 'children'),
+    [Input('interval-update', 'n_intervals')]
+)
+def update_user_display(n):
+    if 'user' in session:
+        return session['user']
+    return "Not logged in"
+
+@app.callback(
+    [Output('resource-message', 'children'),
+     Output('resource-message', 'style')],
+    [Input('request-button', 'n_clicks'),
+     Input('release-button', 'n_clicks')],
+    [State('resource-dropdown', 'value')],
+    prevent_initial_call=True
+)
+def handle_resource_action(request_clicks, release_clicks, resource):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return "", {'padding': '10px', 'border': '1px solid #ddd'}
+    
+    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    if 'user' not in session:
+        return "Please log in first", {'padding': '10px', 'border': '1px solid #ddd', 'color': 'red'}
+    
+    user = session['user']
+    
+    if button_id == 'request-button':
+        success, message = request_resource(user, resource)
+    elif button_id == 'release-button':
+        success, message = release_resource(user, resource)
+    else:
+        return "", {'padding': '10px', 'border': '1px solid #ddd'}
+    
+    style = {
+        'padding': '10px', 
+        'border': '1px solid #ddd', 
+        'color': 'green' if success else 'red',
+        'backgroundColor': '#f0fff0' if success else '#fff0f0'
+    }
+    
+    return message, style
+
+@app.callback(
+    [Output('max-claim-message', 'children'),
+     Output('max-claim-message', 'style')],
+    [Input('update-max-claim', 'n_clicks')],
+    [State('max-claim-resource', 'value'),
+     State('max-claim-value', 'value')],
+    prevent_initial_call=True
+)
+def handle_max_claim_update(n_clicks, resource, value):
+    if not n_clicks:
+        return "", {'padding': '10px', 'border': '1px solid #ddd'}
+    
+    if 'user' not in session:
+        return "Please log in first", {'padding': '10px', 'border': '1px solid #ddd', 'color': 'red'}
+    
+    if value is None:
+        return "Please enter a value", {'padding': '10px', 'border': '1px solid #ddd', 'color': 'red'}
+    
+    user = session['user']
+    success, message = update_max_claim(user, resource, value)
+    
+    style = {
+        'padding': '10px', 
+        'border': '1px solid #ddd', 
+        'color': 'green' if success else 'red',
+        'backgroundColor': '#f0fff0' if success else '#fff0f0'
+    }
+    
+    return message, style
+
+@app.callback(
+    Output('user-allocations', 'children'),
+    [Input('interval-update', 'n_intervals')]
+)
+def update_user_allocations(n):
+    if 'user' not in session:
+        return "Please log in to view your allocations"
+    
+    user = session['user']
+    allocation_rows = []
+    
+    for res in resources:
+        allocation_rows.append(html.Tr([
+            html.Td(res),
+            html.Td(f"{allocation[user][res]:.2f}"),
+            html.Td(f"{max_claim[user][res]:.2f}"),
+            html.Td(f"{(allocation[user][res] / max_claim[user][res] * 100):.1f}%" if max_claim[user][res] > 0 else "0%")
+        ]))
+    
+    table = html.Table([
+        html.Thead(
+            html.Tr([
+                html.Th("Resource"),
+                html.Th("Current Allocation"),
+                html.Th("Maximum Claim"),
+                html.Th("Usage Percentage")
+            ])
+        ),
+        html.Tbody(allocation_rows)
+    ], style={'width': '100%', 'borderCollapse': 'collapse'})
+    
+    return table
+
 @app.callback(
     [Output("resources-graph", "figure"),
      Output("allocation-graph", "figure"),
@@ -461,7 +708,7 @@ def update_graphs(n):
             yaxis_title="Allocated Units"
         )
     
-    # System Usage Graph (new)
+    # System Usage Graph
     system_data = []
     # CPU usage
     cpu_percent = psutil.cpu_percent()
@@ -526,286 +773,322 @@ def on_close(root):
     save_state()
     root.destroy()
 
-# -------------------- TKINTER GUI --------------------
+# -------------------- WEB-BASED GUI --------------------
 
-def create_gui():
-    global log_display
-    
-    root = tk.Tk()
-    root.title("Cloud Resource Manager with Real-time Monitoring")
-    root.geometry("800x600")
-    root.protocol("WM_DELETE_WINDOW", lambda: on_close(root))
-    
-    # Create a style
-    style = ttk.Style()
-    style.configure("TFrame", background="#f0f0f0")
-    style.configure("TLabel", background="#f0f0f0", font=("Arial", 10))
-    style.configure("TButton", font=("Arial", 10))
-    style.configure("Safe.TLabel", foreground="green", font=("Arial", 10, "bold"))
-    style.configure("Unsafe.TLabel", foreground="red", font=("Arial", 10, "bold"))
-    
-    notebook = ttk.Notebook(root)
-    notebook.pack(fill="both", expand=True, padx=10, pady=10)
-    
-    # Login frame
-    login_frame = ttk.Frame(notebook, padding=20)
-    notebook.add(login_frame, text="Login")
-    
-    # Login form
-    ttk.Label(login_frame, text="Username:").grid(row=0, column=0, sticky="w", pady=5)
-    user_entry = ttk.Entry(login_frame, width=30)
-    user_entry.grid(row=0, column=1, sticky="w", pady=5)
-    
-    ttk.Label(login_frame, text="Password:").grid(row=1, column=0, sticky="w", pady=5)
-    pass_entry = ttk.Entry(login_frame, show="*", width=30)
-    pass_entry.grid(row=1, column=1, sticky="w", pady=5)
-    
-    login_status = ttk.Label(login_frame, text="")
-    login_status.grid(row=2, column=0, columnspan=2, pady=10)
-    
-    def authenticate():
-        user = user_entry.get()
-        password = pass_entry.get()
-        if user in users and users[user] == password:
-            user_var.set(user)
-            login_status.config(text=f"Logged in as {user}", foreground="green")
-            notebook.select(1)  # Switch to resource management tab
-            log_event(f"User {user} logged in")
-        else:
-            login_status.config(text="Invalid username or password!", foreground="red")
-    
-    ttk.Button(login_frame, text="Login", command=authenticate).grid(row=3, column=0, columnspan=2, pady=10)
-    
-    # Resource Management frame
-    resource_frame = ttk.Frame(notebook, padding=20)
-    notebook.add(resource_frame, text="Resource Management")
-    
-    user_var = tk.StringVar(value="")
-    resource_var = tk.StringVar(value="CPU")
-    
-    # User and resource selection
-    ttk.Label(resource_frame, text="Current User:").grid(row=0, column=0, sticky="w", pady=5)
-    ttk.Label(resource_frame, textvariable=user_var).grid(row=0, column=1, sticky="w", pady=5)
-    
-    ttk.Label(resource_frame, text="Select Resource:").grid(row=1, column=0, sticky="w", pady=5)
-    resource_menu = ttk.Combobox(resource_frame, textvariable=resource_var, values=list(resources.keys()), state="readonly")
-    resource_menu.grid(row=1, column=1, sticky="w", pady=5)
-    
-    # Resource allocation buttons
-    request_button = ttk.Button(
-        resource_frame, 
-        text="Request Resource", 
-        command=lambda: on_request_resource(user_var.get(), resource_var.get(), status_text)
-    )
-    request_button.grid(row=2, column=0, pady=10, padx=5)
-    
-    release_button = ttk.Button(
-        resource_frame, 
-        text="Release Resource", 
-        command=lambda: on_release_resource(user_var.get(), resource_var.get(), status_text)
-    )
-    release_button.grid(row=2, column=1, pady=10, padx=5)
-    
-    # System monitor display
-    ttk.Label(resource_frame, text="System Monitor:", font=("Arial", 11, "bold")).grid(row=3, column=0, sticky="w", pady=5)
-    system_frame = ttk.Frame(resource_frame)
-    system_frame.grid(row=4, column=0, columnspan=2, sticky="w", pady=5)
-    
-    # Create labels for real-time system info
-    cpu_label = ttk.Label(system_frame, text="CPU: Loading...")
-    cpu_label.pack(anchor="w")
-    
-    memory_label = ttk.Label(system_frame, text="Memory: Loading...")
-    memory_label.pack(anchor="w")
-    
-    disk_label = ttk.Label(system_frame, text="Disk: Loading...")
-    disk_label.pack(anchor="w")
-    
-    network_label = ttk.Label(system_frame, text="Network: Loading...")
-    network_label.pack(anchor="w")
-    
-    # Banker's Algorithm Status
-    ttk.Label(resource_frame, text="Banker's Algorithm Status:").grid(row=5, column=0, sticky="w", pady=5)
-    safety_status_var = tk.StringVar(value="Checking system safety...")
-    safety_status_label = ttk.Label(resource_frame, textvariable=safety_status_var)
-    safety_status_label.grid(row=5, column=1, sticky="w", pady=5)
-    
-    safe_sequence_var = tk.StringVar(value="")
-    ttk.Label(resource_frame, textvariable=safe_sequence_var, wraplength=400).grid(row=6, column=0, columnspan=2, sticky="w", pady=5)
-    
-    # Resource status display
-    ttk.Label(resource_frame, text="Resource Status:").grid(row=7, column=0, sticky="w", pady=5)
-    status_frame = ttk.Frame(resource_frame)
-    status_frame.grid(row=8, column=0, columnspan=2, sticky="w", pady=5)
-    
-    status_text = tk.StringVar(value="")
-    ttk.Label(status_frame, textvariable=status_text, wraplength=400).pack(anchor="w")
-    
-    # User allocation display
-    ttk.Label(resource_frame, text="Your Allocations:").grid(row=9, column=0, sticky="w", pady=5)
-    user_allocation_text = tk.StringVar(value="")
-    ttk.Label(resource_frame, textvariable=user_allocation_text, wraplength=400).grid(row=10, column=0, columnspan=2, sticky="w", pady=5)
-    
-    # Maximum claim management
-    ttk.Separator(resource_frame, orient='horizontal').grid(row=11, column=0, columnspan=2, sticky="ew", pady=10)
-    
-    ttk.Label(resource_frame, text="Max Claim Management:").grid(row=12, column=0, sticky="w", pady=5)
-    
-    max_claim_frame = ttk.Frame(resource_frame)
-    max_claim_frame.grid(row=13, column=0, columnspan=2, sticky="w", pady=5)
-    
-    ttk.Label(max_claim_frame, text="Resource:").grid(row=0, column=0, padx=5)
-    max_claim_resource = ttk.Combobox(max_claim_frame, values=list(resources.keys()), state="readonly", width=10)
-    max_claim_resource.grid(row=0, column=1, padx=5)
-    max_claim_resource.current(0)
-    
-    ttk.Label(max_claim_frame, text="New Max:").grid(row=0, column=2, padx=5)
-    max_claim_value = ttk.Entry(max_claim_frame, width=8)
-    max_claim_value.grid(row=0, column=3, padx=5)
-    
-    def update_max_claim_gui():
-        user = user_var.get()
-        if not user:
-            messagebox.showwarning("Authentication Required", "Please login first!")
-            notebook.select(0)  # Switch to login tab
-            return
+def start_web_app():
+    global dashboard_server_running
+    if not dashboard_server_running:
+        dashboard_server_running = True
+        # Open browser after a short delay to ensure the server is running
+        threading.Timer(1.5, lambda: webbrowser.open_new("http://127.0.0.1:8050")).start()
         
-        resource = max_claim_resource.get()
-        if not resource:
-            messagebox.showwarning("Input Error", "Please select a resource!")
-            return
-        
-        try:
-            new_max = float(max_claim_value.get())
-            if new_max < 0:
-                raise ValueError("Max claim must be a positive number")
+        # Create the Dash app
+        app.layout = html.Div([
+            html.H1("Cloud Resource Manager with Real-time Monitoring", className="app-header"),
+            
+            # Login Section
+            html.Div([
+                html.H2("Login"),
+                html.Div([
+                    html.Label("Username:"),
+                    dcc.Input(id="username-input", type="text", placeholder="Enter username"),
+                    html.Br(),
+                    html.Label("Password:"),
+                    dcc.Input(id="password-input", type="password", placeholder="Enter password"),
+                    html.Br(),
+                    html.Button("Login", id="login-button", n_clicks=0),
+                    html.Div(id="login-status")
+                ], id="login-container")
+            ], id="login-section"),
+            
+            # Resource Management Section
+            html.Div([
+                html.H2("Resource Management"),
+                html.Div([
+                    html.Label("Current User:"),
+                    html.Div(id="current-user", style={"fontWeight": "bold"}),
+                    html.Br(),
+                    html.Label("Select Resource:"),
+                    dcc.Dropdown(
+                        id="resource-dropdown",
+                        options=[{"label": res, "value": res} for res in resources.keys()],
+                        value="CPU"
+                    ),
+                    html.Br(),
+                    html.Button("Request Resource", id="request-button", n_clicks=0),
+                    html.Button("Release Resource", id="release-button", n_clicks=0, style={"marginLeft": "10px"}),
+                    html.Div(id="resource-status", style={"marginTop": "10px"})
+                ]),
                 
-            if update_max_claim(user, resource, new_max):
-                messagebox.showinfo("Max Claim Updated", f"Maximum claim for {resource} updated to {new_max}")
-        except ValueError as e:
-            messagebox.showerror("Input Error", f"Invalid value: {e}")
-    
-    ttk.Button(max_claim_frame, text="Update Max Claim", command=update_max_claim_gui).grid(row=0, column=4, padx=5)
-    
-    # Dashboard button
-    dashboard_button = ttk.Button(
-        resource_frame, 
-        text="Open Dashboard", 
-        command=lambda: threading.Thread(target=start_dashboard, daemon=True).start()
-    )
-    dashboard_button.grid(row=14, column=0, columnspan=2, pady=20)
-    
-    # Logs Frame
-   # Logs Frame
-    logs_frame = ttk.Frame(notebook, padding=20)
-    notebook.add(logs_frame, text="System Logs")
-    
-    ttk.Label(logs_frame, text="System Activity Logs:", font=("Arial", 11, "bold")).pack(anchor="w", pady=5)
-    
-    # Create a scrolled text widget for logs
-    log_display = scrolledtext.ScrolledText(logs_frame, width=80, height=20)
-    log_display.pack(fill="both", expand=True, padx=5, pady=5)
-    log_display.configure(state='disabled')
-    
-    # Populate logs
-    log_display.configure(state='normal')
-    for log_entry in logs:
-        log_display.insert(tk.END, log_entry + "\n")
-    log_display.see(tk.END)
-    log_display.configure(state='disabled')
-    
-    # Clear logs button
-    def clear_logs():
-        global logs
-        if messagebox.askyesno("Clear Logs", "Are you sure you want to clear all logs?"):
-            logs = []
-            log_display.configure(state='normal')
-            log_display.delete(1.0, tk.END)
-            log_display.configure(state='disabled')
-            save_state()
-            messagebox.showinfo("Logs Cleared", "All logs have been cleared.")
-    
-    ttk.Button(logs_frame, text="Clear Logs", command=clear_logs).pack(pady=10)
-    
-    # Function to handle resource requests
-    def on_request_resource(user, resource, status_var):
-        if not user:
-            messagebox.showwarning("Authentication Required", "Please login first!")
-            notebook.select(0)  # Switch to login tab
-            return
+                # System Monitor
+                html.Div([
+                    html.H3("System Monitor"),
+                    dcc.Graph(id="system-usage-graph"),
+                    html.Div(id="system-info")
+                ]),
+                
+                # Banker's Algorithm Status
+                html.Div([
+                    html.H3("Banker's Algorithm Status"),
+                    html.Div(id="safety-status"),
+                    html.Div(id="safe-sequence")
+                ]),
+                
+                # User Allocations
+                html.Div([
+                    html.H3("Your Allocations"),
+                    html.Div(id="user-allocations")
+                ]),
+                
+                # Max Claim Management
+                html.Div([
+                    html.H3("Max Claim Management"),
+                    html.Label("Resource:"),
+                    dcc.Dropdown(
+                        id="max-claim-resource",
+                        options=[{"label": res, "value": res} for res in resources.keys()],
+                        value="CPU"
+                    ),
+                    html.Label("New Max:"),
+                    dcc.Input(id="max-claim-value", type="number", min=0, step=0.1),
+                    html.Button("Update Max Claim", id="update-max-claim-button", n_clicks=0),
+                    html.Div(id="max-claim-status")
+                ]),
+                
+                # Refresh Button
+                html.Button("Refresh Data", id="refresh-button", n_clicks=0, style={"marginTop": "20px"})
+            ], id="resource-section", style={"display": "none"}),
+            
+            # System Logs Section
+            html.Div([
+                html.H2("System Logs"),
+                html.Button("Clear Logs", id="clear-logs-button", n_clicks=0),
+                html.Div(id="logs-container", style={"maxHeight": "400px", "overflowY": "auto", "border": "1px solid #ddd", "padding": "10px", "marginTop": "10px"})
+            ]),
+            
+            # Store the current user
+            dcc.Store(id="user-store"),
+            
+            # Interval for periodic updates
+            dcc.Interval(id="interval-component", interval=2000, n_intervals=0)  # Update every 2 seconds
+        ])
         
-        if request_resource(user, resource):
-            status_var.set(f"Successfully allocated {resource} to {user}")
-            update_gui_info()
-        else:
-            status_var.set(f"Failed to allocate {resource} to {user}")
-    
-    # Function to handle resource releases
-    def on_release_resource(user, resource, status_var):
-        if not user:
-            messagebox.showwarning("Authentication Required", "Please login first!")
-            notebook.select(0)  # Switch to login tab
-            return
+        # Callbacks
         
-        if release_resource(user, resource):
-            status_var.set(f"Successfully released {resource} from {user}")
-            update_gui_info()
-        else:
-            status_var.set(f"Failed to release {resource} from {user}")
-    
-    # Function to update GUI information
-    def update_gui_info():
-        # Update system resource labels
-        update_system_resources()
-        cpu_label.config(text=f"CPU: {resources['CPU']:.2f} units available")
-        memory_label.config(text=f"Memory: {resources['Memory']:.2f} GB available")
-        disk_label.config(text=f"Disk: {resources['Disk']:.2f} GB available")
-        network_label.config(text=f"Network: {resources['Network']:.2f} units available")
+        # Login callback
+        @app.callback(
+            [Output("login-status", "children"),
+             Output("user-store", "data"),
+             Output("login-section", "style"),
+             Output("resource-section", "style")],
+            [Input("login-button", "n_clicks")],
+            [State("username-input", "value"),
+             State("password-input", "value")]
+        )
+        def authenticate(n_clicks, username, password):
+            if n_clicks == 0:
+                return "", None, {"display": "block"}, {"display": "none"}
+            
+            if username in users and users[username] == password:
+                log_event(f"User {username} logged in")
+                return html.Div(f"Logged in as {username}", style={"color": "green"}), username, {"display": "none"}, {"display": "block"}
+            else:
+                return html.Div("Invalid username or password!", style={"color": "red"}), None, {"display": "block"}, {"display": "none"}
         
-        # Update safety status
-        is_safe, safe_sequence = is_safe_state()
-        if is_safe:
-            safety_status_var.set("✅ SAFE")
-            safety_status_label.config(style="Safe.TLabel")
-            safe_sequence_var.set(f"Safe sequence: {' → '.join(safe_sequence)}")
-        else:
-            safety_status_var.set("⚠️ UNSAFE")
-            safety_status_label.config(style="Unsafe.TLabel")
-            safe_sequence_var.set("System is in an unsafe state! Risk of deadlock.")
+        # Display current user
+        @app.callback(
+            Output("current-user", "children"),
+            [Input("user-store", "data")]
+        )
+        def update_current_user(user):
+            return user if user else "Not logged in"
+        
+        # Request resource callback
+        @app.callback(
+            Output("resource-status", "children"),
+            [Input("request-button", "n_clicks"),
+             Input("release-button", "n_clicks")],
+            [State("user-store", "data"),
+             State("resource-dropdown", "value")]
+        )
+        def handle_resource_actions(request_clicks, release_clicks, user, resource):
+            ctx = dash.callback_context
+            if not ctx.triggered:
+                return ""
+            
+            button_id = ctx.triggered[0]["prop_id"].split(".")[0]
+            
+            if not user:
+                return html.Div("Please login first!", style={"color": "red"})
+            
+            if button_id == "request-button" and request_clicks > 0:
+                if request_resource(user, resource):
+                    return html.Div(f"Successfully allocated {resource} to {user}", style={"color": "green"})
+                else:
+                    return html.Div(f"Failed to allocate {resource} to {user}", style={"color": "red"})
+            
+            elif button_id == "release-button" and release_clicks > 0:
+                if release_resource(user, resource):
+                    return html.Div(f"Successfully released {resource} from {user}", style={"color": "green"})
+                else:
+                    return html.Div(f"Failed to release {resource} from {user}", style={"color": "red"})
+            
+            return ""
+        
+        # Update system info
+        @app.callback(
+            [Output("system-info", "children"),
+             Output("system-usage-graph", "figure"),
+             Output("safety-status", "children"),
+             Output("safe-sequence", "children")],
+            [Input("interval-component", "n_intervals"),
+             Input("refresh-button", "n_clicks")]
+        )
+        def update_system_info(n_intervals, n_clicks):
+            # Update system resources
+            update_system_resources()
+            
+            # System info
+            system_info = [
+                html.Div(f"CPU: {resources['CPU']:.2f} units available"),
+                html.Div(f"Memory: {resources['Memory']:.2f} GB available"),
+                html.Div(f"Disk: {resources['Disk']:.2f} GB available"),
+                html.Div(f"Network: {resources['Network']:.2f} units available")
+            ]
+            
+            # System usage graph
+            system_data = []
+            for res, value in resources.items():
+                # Convert available resources to usage percentage
+                if res == "CPU":
+                    cpu_count = psutil.cpu_count(logical=True)
+                    usage_percent = 100 - (resources[res] / cpu_count * 100)
+                    system_data.append({"Resource": res, "Usage": min(100, max(0, usage_percent))})
+                elif res == "Memory":
+                    total_memory = psutil.virtual_memory().total / (1024 ** 3)
+                    usage_percent = 100 - (resources[res] / total_memory * 100)
+                    system_data.append({"Resource": res, "Usage": min(100, max(0, usage_percent))})
+                elif res == "Disk":
+                    total_disk = psutil.disk_usage('/').total / (1024 ** 3)
+                    usage_percent = 100 - (resources[res] / total_disk * 100)
+                    system_data.append({"Resource": res, "Usage": min(100, max(0, usage_percent))})
+                else:
+                    # For Network, just use a placeholder
+                    system_data.append({"Resource": res, "Usage": 100 - resources[res]})
+            
+            df_system = pd.DataFrame(system_data)
+            
+            fig_system = go.Figure()
+            fig_system.add_trace(go.Bar(
+                x=df_system["Resource"],
+                y=df_system["Usage"],
+                marker_color=['blue' if x < 70 else 'orange' if x < 90 else 'red' for x in df_system["Usage"]],
+            ))
+            
+            fig_system.update_layout(
+                title="System Resource Usage (%)",
+                xaxis_title="Resource",
+                yaxis_title="Usage (%)",
+                yaxis=dict(range=[0, 100])
+            )
+            
+            # Banker's Algorithm Safety Status
+            is_safe, safe_sequence = is_safe_state()
+            if is_safe:
+                safety_status = [
+                    html.Div("✅ System is in a SAFE state", style={'color': 'green', 'fontWeight': 'bold'})
+                ]
+                safe_sequence_text = html.Div(f"Safe Sequence: {' → '.join(safe_sequence)}")
+            else:
+                safety_status = [
+                    html.Div("⚠️ System is in an UNSAFE state", style={'color': 'red', 'fontWeight': 'bold'})
+                ]
+                safe_sequence_text = html.Div("Warning: Potential deadlock condition! Consider releasing resources.")
+            
+            return system_info, fig_system, safety_status, safe_sequence_text
         
         # Update user allocations
-        user = user_var.get()
-        if user:
-            alloc_text = ""
+        @app.callback(
+            Output("user-allocations", "children"),
+            [Input("interval-component", "n_intervals"),
+             Input("refresh-button", "n_clicks"),
+             Input("resource-status", "children")],
+            [State("user-store", "data")]
+        )
+        def update_user_allocations(n_intervals, n_clicks, resource_status, user):
+            if not user:
+                return "Please login to view your allocations"
+            
+            alloc_items = []
             for res in resources:
-                alloc_text += f"{res}: {allocation[user][res]:.2f} / {max_claim[user][res]:.2f} (used/max)\n"
-            user_allocation_text.set(alloc_text)
-    
-    # Periodic update function
-    def periodic_update():
-        if root.winfo_exists():
-            update_gui_info()
-            root.after(2000, periodic_update)  # Update every 2 seconds
-    
-    # Start periodic updates
-    root.after(1000, periodic_update)
-    
-    # Initial update
-    update_gui_info()
-    
-    # Start system monitor in a separate thread
-    monitor_thread = threading.Thread(target=system_monitor, daemon=True)
-    monitor_thread.start()
-    
-    return root
+                alloc_items.append(
+                    html.Div(f"{res}: {allocation[user][res]:.2f} / {max_claim[user][res]:.2f} (used/max)")
+                )
+            
+            return alloc_items
+        
+        # Update max claim
+        @app.callback(
+            Output("max-claim-status", "children"),
+            [Input("update-max-claim-button", "n_clicks")],
+            [State("user-store", "data"),
+             State("max-claim-resource", "value"),
+             State("max-claim-value", "value")]
+        )
+        def update_max_claim_callback(n_clicks, user, resource, new_max):
+            if n_clicks == 0:
+                return ""
+            
+            if not user:
+                return html.Div("Please login first!", style={"color": "red"})
+            
+            if not resource:
+                return html.Div("Please select a resource!", style={"color": "red"})
+            
+            if new_max is None:
+                return html.Div("Please enter a valid value!", style={"color": "red"})
+            
+            try:
+                if new_max < 0:
+                    return html.Div("Max claim must be a positive number", style={"color": "red"})
+                
+                if update_max_claim(user, resource, new_max):
+                    return html.Div(f"Maximum claim for {resource} updated to {new_max}", style={"color": "green"})
+                else:
+                    return html.Div("Failed to update max claim", style={"color": "red"})
+            except Exception as e:
+                return html.Div(f"Error: {str(e)}", style={"color": "red"})
+        
+        # Update logs
+        @app.callback(
+            Output("logs-container", "children"),
+            [Input("interval-component", "n_intervals"),
+             Input("clear-logs-button", "n_clicks")]
+        )
+        def update_logs(n_intervals, n_clicks):
+            # Clear logs if button was clicked
+            if dash.callback_context.triggered_id == "clear-logs-button" and n_clicks > 0:
+                global logs
+                logs = []
+                save_state()
+                return [html.P("Logs cleared")]
+            
+            # Display logs
+            return [html.P(log) for log in logs[-50:]]  # Show last 50 logs
+        
+        # Start the system monitor in a separate thread
+        monitor_thread = threading.Thread(target=system_monitor, daemon=True)
+        monitor_thread.start()
+        
+        # Run the app
+        app.run_server(debug=False, use_reloader=False, port=8050)
 
 def main():
     # Load previous state
     load_state()
     
-    # Create and run the GUI
-    root = create_gui()
-    root.mainloop()
+    # Start the web app
+    start_web_app()
 
 if __name__ == "__main__":
     main()
