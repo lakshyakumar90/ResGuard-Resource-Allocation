@@ -14,6 +14,11 @@ import webbrowser
 import numpy as np
 import psutil  # Added psutil for real system monitoring
 
+if not os.environ.get("DISPLAY"):
+    print("No display found, running in CLI mode.")
+    # Run CLI-based logic here instead of GUI
+    exit()
+
 # Global Variables
 mutex = threading.Lock()
 # Instead of fixed resources, we'll dynamically get them
