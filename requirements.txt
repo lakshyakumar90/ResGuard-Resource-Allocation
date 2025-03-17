@@ -1,0 +1,7 @@
+Flask==2.2.3
+dash==2.14.2
+plotly==5.18.0
+pandas==1.5.3
+numpy==1.24.2
+psutil==5.9.8
+tk
